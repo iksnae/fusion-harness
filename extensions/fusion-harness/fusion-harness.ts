@@ -10,6 +10,7 @@
  *   /fh-debate       N-way all-to-all debate, no judge           (modules/cmd-readonly.ts)
  *   /fh-fusion       N sources → sole-writer FUSION → ACKs       (modules/cmd-fusion.ts)
  *   /fh-collaborate  plans → architect DAG → readiness execution (modules/cmd-build.ts)
+ *   /fh-gauntlet     build → blind critic panel → repair, looped   (modules/cmd-gauntlet.ts)
  *   /fh-auto-validate architect + Main gate-first build loop     (modules/cmd-build.ts)
  *   /fh-only         direct one slot or arm the next plain prompt
  *   /fh-model        slot → model → thinking picker (session-only)
@@ -47,6 +48,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, Text, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { registerAutoValidateCommand, registerCollaborateCommand } from "./modules/cmd-build.ts";
 import { registerFusionCommand } from "./modules/cmd-fusion.ts";
+import { registerGauntletCommand } from "./modules/cmd-gauntlet.ts";
 import { registerReadonlyCommands } from "./modules/cmd-readonly.ts";
 import { piInvocation, runChild } from "./modules/child-runner.ts";
 import {
@@ -111,6 +113,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerFlag("max-validations", {
 		type: "string",
 		description: "Max gate validations (build attempts) for /fh-auto-validate before development halts. Default 5. Also overridable inline: /fh-auto-validate --max-validations 3 <prompt>.",
+	});
+	pi.registerFlag("max-gauntlet-rounds", {
+		type: "string",
+		description:
+			"Max adversarial review rounds for /fh-gauntlet before it reports what is still open. Default 3. Also overridable inline: /fh-gauntlet --max-rounds 5 <prompt>.",
 	});
 	pi.registerFlag("escalate-to-validator-count", {
 		type: "string",
@@ -1026,6 +1033,7 @@ export default function (pi: ExtensionAPI) {
 		['/fh-fusion "<prompt>" "<fusion>"', "parallel research, one writer, all ACK"],
 		["/fh-debate [--rounds N] <prompt>", "all-to-all debate, no judge"],
 		["/fh-collaborate <prompt>", "agents plan, architect delegates, parallel build"],
+		["/fh-gauntlet [--max-rounds N] <prompt>", "build, then blind critics audit until nothing is left"],
 		["/fh-only [slot] [prompt]", "route one prompt to one agent"],
 		["/fh-model", "pick slot, model, thinking"],
 		["/fh-auto-validate [--max-validations N] <prompt>", "gate written first, build until green"],
@@ -1286,5 +1294,6 @@ export default function (pi: ExtensionAPI) {
 	registerReadonlyCommands(pi, deps); // /fh-opinion + /fh-debate
 	registerFusionCommand(pi, deps); // /fh-fusion
 	registerCollaborateCommand(pi, deps); // /fh-collaborate
+	registerGauntletCommand(pi, deps); // /fh-gauntlet
 	registerAutoValidateCommand(pi, deps); // /fh-auto-validate
 }

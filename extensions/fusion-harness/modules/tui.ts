@@ -17,6 +17,7 @@ import {
 	fmtSecs,
 	ROLE_COLOR,
 	ROLE_GLYPH,
+	SLOT_NAMED_ROLES,
 	runError,
 	runTps,
 	shortModel,
@@ -148,7 +149,10 @@ export function mdLines(text: string, colW: number): string[] {
 
 /** `◆ ARCHITECT | name | model` — the role-colored label that opens every column and cell. */
 export const roleLabelStr = (theme: any, role: Role, model: string, bold = true, sep = " | ", slot?: ModelSlot) => {
-	const roleName = slot ? (slot.architect ? "ARCHITECT" : "BUILDER") : role;
+	// A slot only DICTATES the label for the two slot-named roles. Any other hat the slot
+	// is wearing (CRITIC, ADJUDICATOR, INTEGRATOR, VALIDATOR, FUSION) keeps its own name —
+	// otherwise every gauntlet column would read "BUILDER" and the flow would be unreadable.
+	const roleName = slot && SLOT_NAMED_ROLES.has(role) ? (slot.architect ? "ARCHITECT" : "BUILDER") : role;
 	const label = `${ROLE_GLYPH[role]} ${roleName}${slot ? ` | ${slot.name}` : ""}`;
 	if (slot) return fgHex(slot.color, bold ? theme.bold(label) : label) + theme.fg("dim", sep) + fgHex(slot.color, shortModel(model));
 	return theme.fg(ROLE_COLOR[role], bold ? theme.bold(label) : label) + theme.fg("dim", sep) + theme.fg(ROLE_COLOR[role], shortModel(model));
@@ -156,7 +160,7 @@ export const roleLabelStr = (theme: any, role: Role, model: string, bold = true,
 
 export const statLabelStr = (theme: any, stat: AgentStat): string => {
 	if (!stat.color || !stat.slotName) return roleLabelStr(theme, stat.role, stat.model);
-	const roleName = stat.architect ? "ARCHITECT" : "BUILDER";
+	const roleName = SLOT_NAMED_ROLES.has(stat.role) ? (stat.architect ? "ARCHITECT" : "BUILDER") : stat.role;
 	return fgHex(stat.color, theme.bold(`${ROLE_GLYPH[stat.role]} ${roleName} | ${stat.slotName}`)) + theme.fg("dim", " | ") + fgHex(stat.color, shortModel(stat.model));
 };
 
@@ -418,7 +422,7 @@ export function renderFhPanel(message: any, theme: any): any {
 		case "gate": {
 			add(
 				new Text(
-					theme.fg("customMessageLabel", theme.bold(`FUSION HARNESS · /fh-auto-validate — `)) +
+					theme.fg("customMessageLabel", theme.bold(`FUSION HARNESS · /${d.command ?? "fh-auto-validate"} — `)) +
 						theme.fg("mdLink", theme.bold(d.round ? `GATE REPAIRED ⚒ (after round ${d.round})` : "GATE DESIGNED ⛨")) +
 						(d.agent ? theme.fg("dim", `   ${roleLabelStr(theme, d.agent.role, d.agent.model, false)}${theme.fg("dim", ` · ${statLine(d.agent)}`)}`) : ""),
 					1,
@@ -465,6 +469,70 @@ export function renderFhPanel(message: any, theme: any): any {
 			if (d.scriptPath) add(new Text(theme.fg("dim", `  gate: ${d.scriptPath}`), 1, 0));
 			blank();
 			duoBody();
+			break;
+		}
+		case "rubric": {
+			// The acceptance bar, rendered before anything is built. It is a deliverable in
+			// its own right: if the bar is wrong, every round after it is wasted.
+			add(
+				new Text(
+					theme.fg("customMessageLabel", theme.bold(`FUSION HARNESS · /${d.command ?? "fh-gauntlet"} — `)) +
+						theme.fg("mdLink", theme.bold(`⛨ ACCEPTANCE BAR (${d.criteriaTotal ?? "?"} criteria)`)) +
+						(d.agent ? theme.fg("dim", `   ${roleLabelStr(theme, d.agent.role, d.agent.model, false)} · ${statLine(d.agent)}`) : ""),
+					1,
+					0,
+				),
+			);
+			add(new Text(theme.fg("dim", `  written before the build · judged by blind critics each round · max ${d.maxRounds ?? "?"} rounds`), 1, 0));
+			blank();
+			md(content);
+			break;
+		}
+		case "verdicts": {
+			// One round of the panel. Critics get columns like any other agent grid, because
+			// WHO dissented matters as much as what they found.
+			const cleared = d.criteriaPassed ?? 0;
+			const total = d.criteriaTotal ?? 0;
+			add(
+				new Text(
+					theme.fg("customMessageLabel", theme.bold(`⚔ BLIND CRITIC PANEL`)) +
+						theme.fg("dim", ` · round ${d.round ?? "?"}/${d.maxRounds ?? "?"} · `) +
+						theme.fg(d.ok ? "success" : "error", theme.bold(`${cleared}/${total} cleared`)) +
+						theme.fg("dim", ` · gate exit ${d.gateExitCode ?? "?"}`),
+					1,
+					0,
+				),
+			);
+			add(new Text(theme.fg("dim", "  fresh sessions, no builder reports, no prior verdicts — one dissent keeps a criterion open"), 1, 0));
+			blank();
+			md(content);
+			blank();
+			multiBody();
+			break;
+		}
+		case "gauntlet": {
+			const verdict =
+				d.stopReason === "passed"
+					? theme.fg("success", theme.bold("CLEARED ✓"))
+					: d.stopReason === "plateau"
+						? theme.fg("warning", theme.bold("PLATEAUED ⚠"))
+						: d.stopReason === "exhausted"
+							? theme.fg("warning", theme.bold("EXHAUSTED ⚠"))
+							: theme.fg("mdLink", theme.bold("ADJUDICATION ⚖"));
+			add(
+				new Text(
+					theme.fg("customMessageLabel", theme.bold(`⚔ GAUNTLET`)) +
+						theme.fg("dim", " · ") +
+						verdict +
+						theme.fg("dim", ` · round ${d.round ?? "?"}/${d.maxRounds ?? "?"}`) +
+						(d.criteriaTotal ? theme.fg("dim", ` · ${d.criteriaPassed ?? 0}/${d.criteriaTotal} criteria`) : "") +
+						(d.agent ? theme.fg("dim", `   last word: `) + theme.fg(ROLE_COLOR[d.agent.role], d.agent.role) : ""),
+					1,
+					0,
+				),
+			);
+			blank();
+			md(content);
 			break;
 		}
 		default: {

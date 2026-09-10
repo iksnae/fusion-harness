@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { runChild, runProc } from "./child-runner.ts";
-import { validateCollaborationPlan, type CollaborationTask, type ValidatedCollaborationPlan } from "./collaboration-graph.ts";
+import { validateCollaborationPlan, type ValidatedCollaborationPlan } from "./collaboration-graph.ts";
 import { orderedSlots, slotId } from "./model-stack.ts";
 import {
 	builderPrompt,
@@ -49,6 +49,7 @@ import {
 	type HarnessDeps,
 	type Role,
 } from "./runtime.ts";
+import { enterWriter, executeTaskGraph, exitWriter, newWriterCounter, TASK_GLYPH, type TaskState } from "./task-executor.ts";
 import { acquireWriterLease, type WriterLease } from "./writer-lease.ts";
 
 // ═══ /fh-collaborate ═════════════════════════════════════════════════════════
@@ -92,8 +93,9 @@ export function registerCollaborateCommand(pi: ExtensionAPI, h: HarnessDeps): vo
 			// and execution all show each model's live flow, exactly like the other commands.
 			const stopWidget = h.startGridWidget(ctx, "fh-collaborate", runs, undefined, startedAt);
 			let writerLease: WriterLease | undefined;
-			let maxConcurrentWriteEnabledChildren = 0;
-			let activeWriters = 0;
+			// The single-writer accounting lives in task-executor.ts and is shared with
+			// /fh-gauntlet — one invariant, one implementation.
+			const writers = newWriterCounter();
 			const taskExecutions: Array<{ taskId: string; slot: string; mode: "read" | "write"; startedAt: number; endedAt: number; ok: boolean }> = [];
 			let plan: ValidatedCollaborationPlan | undefined;
 			try {
@@ -177,87 +179,42 @@ export function registerCollaborateCommand(pi: ExtensionAPI, h: HarnessDeps): vo
 				}
 
 				// ── Phase 3: dependency-driven execution ──
-				// A task launches the moment its deps are done AND its slot is free; reads
-				// overlap anything, writes wait for the single global writer token (the
-				// activeWriters increment is synchronous inside executeTask, so at most one
-				// write-enabled child ever runs). Plan order is the FIFO tiebreak.
+				// Scheduling and the single-writer invariant live in task-executor.ts, shared
+				// with /fh-gauntlet. This command supplies the prompts, the panels, and where
+				// the reports land.
 				const reportsDir = path.join(collabDir, "reports");
 				await fs.promises.mkdir(reportsDir, { recursive: true });
-				type TaskState = "blocked" | "queued" | "reading" | "writing" | "done" | "failed";
-				const taskState = new Map<string, TaskState>(plan.tasks.map((task) => [task.id, "blocked"]));
-				const taskReports = new Map<string, string>();
-				const busySlots = new Set<string>();
-				const inFlight = new Map<string, Promise<void>>();
-				let executionFailure: string | undefined;
-				const TASK_GLYPH: Record<TaskState, string> = { blocked: "○", queued: "◌", reading: "◐", writing: "●", done: "✓", failed: "✗" };
-				const renderBoard = () => {
+				const renderBoard = (states: ReadonlyMap<string, TaskState>) => {
 					try {
 						ctx.ui.setWidget(TASKBOARD_WIDGET, [
-							`⇄ TASKS · ${[...taskState.values()].filter((state) => state === "done").length}/${plan!.tasks.length} done · reads overlap · ONE writer at a time`,
-							...plan!.tasks.map((task) => `  ${TASK_GLYPH[taskState.get(task.id)!]} ${task.id} · ${task.assignee} · ${task.mode} · ${taskState.get(task.id)} · ${task.description.replace(/\s+/g, " ").slice(0, 60)}${task.description.length > 60 ? "…" : ""}`),
+							`⇄ TASKS · ${[...states.values()].filter((state) => state === "done").length}/${plan!.tasks.length} done · reads overlap · ONE writer at a time`,
+							...plan!.tasks.map((task) => `  ${TASK_GLYPH[states.get(task.id)!]} ${task.id} · ${task.assignee} · ${task.mode} · ${states.get(task.id)} · ${task.description.replace(/\s+/g, " ").slice(0, 60)}${task.description.length > 60 ? "…" : ""}`),
 						], { placement: "belowEditor" });
 					} catch {}
 				};
-				const depsDone = (task: CollaborationTask): boolean => task.depends_on.every((dep) => taskState.get(dep) === "done");
-				const taskHandoff = (task: CollaborationTask): string => {
-					const parts = [`Collaboration artifacts: ${collabDir}`, `Delegation plan: ${planPath}`, `All finished task reports: ${reportsDir}`];
-					for (const dep of task.depends_on) parts.push(`\n## COMPLETED DEPENDENCY ${dep}\n${taskReports.get(dep) ?? "(report on disk)"}`);
-					return parts.join("\n");
-				};
-				const executeTask = async (task: CollaborationTask): Promise<void> => {
-					const slot = slots.find((candidate) => candidate.id === task.assignee)!;
-					const run = runBySlot.get(slot.id)!;
-					const taskStartedAt = Date.now();
-					const write = task.mode === "write";
-					// Synchronous before the first await — the scheduler's writer check relies on it.
-					if (write) {
-						activeWriters++;
-						maxConcurrentWriteEnabledChildren = Math.max(maxConcurrentWriteEnabledChildren, activeWriters);
-					}
-					try {
-						await runChild({ run, prompt: collabExecutePrompt(slot, prompt, task, taskHandoff(task)), systemPrompt: slot.systemPrompt, appendSystemPrompts: slot.appendSystemPrompts, tools: write ? FULL_TOOLS : READONLY_TOOLS, thinking: slot.thinking, ...h.slotNextSpawn(slot, run, initialSpawns.get(slot.id)!, ctx), cwd: ctx.cwd, timeoutMs: h.childTimeoutMs(), signal: stopper.signal });
-					} finally {
-						if (write) activeWriters--;
-					}
-					const ok = runOk(run) && !stopper.stopped();
-					taskExecutions.push({ taskId: task.id, slot: slot.id, mode: task.mode, startedAt: taskStartedAt, endedAt: Date.now(), ok });
-					const report = runOk(run) ? run.text : `FAILED: ${runError(run)}`;
-					taskReports.set(task.id, report);
-					await h.save(reportsDir, `${task.id}-${slot.id}.md`, report);
-					taskState.set(task.id, ok ? "done" : "failed");
-					if (!stopper.stopped()) {
-						// Every finished task renders its report — the intermediate work IS the output.
-						h.panel({ kind: "solo", command: "fh-collaborate", ok, agent: toStat(run), artifactsDir }, `### Task ${task.id} (${task.mode}) — ${slot.name}\n${task.description}\n\n${report}`);
-						if (!ok) executionFailure ??= `task ${task.id} (${slot.id}) failed: ${runError(run)}`;
-					}
-				};
 				ctx.ui.setStatus(CUSTOM_TYPE, "collaborate: executing the delegation graph…");
-				renderBoard();
-				while (!stopper.stopped()) {
-					if (!executionFailure) {
-						for (const task of plan.tasks) {
-							const current = taskState.get(task.id)!;
-							if (current !== "blocked" && current !== "queued") continue;
-							if (!depsDone(task)) continue;
-							if (busySlots.has(task.assignee) || (task.mode === "write" && activeWriters > 0)) {
-								taskState.set(task.id, "queued");
-								continue;
-							}
-							busySlots.add(task.assignee);
-							taskState.set(task.id, task.mode === "read" ? "reading" : "writing");
-							const running = executeTask(task).finally(() => {
-								busySlots.delete(task.assignee);
-								inFlight.delete(task.id);
-							});
-							inFlight.set(task.id, running);
-						}
-					}
-					renderBoard();
-					if (!inFlight.size) break;
-					await Promise.race(inFlight.values());
-				}
-				await Promise.allSettled([...inFlight.values()]);
-				renderBoard();
+				const graph = await executeTaskGraph({
+					tasks: plan.tasks,
+					slotFor: (assignee) => slots.find((candidate) => candidate.id === assignee)!,
+					runFor: (assignee) => runBySlot.get(assignee)!,
+					promptFor: (task, handoff) => collabExecutePrompt(slots.find((candidate) => candidate.id === task.assignee)!, prompt, task, handoff),
+					handoffHeader: () => [`Collaboration artifacts: ${collabDir}`, `Delegation plan: ${planPath}`, `All finished task reports: ${reportsDir}`],
+					spawnFor: (slot, run) => h.slotNextSpawn(slot, run, initialSpawns.get(slot.id)!, ctx),
+					counter: writers,
+					cwd: ctx.cwd,
+					timeoutMs: h.childTimeoutMs(),
+					signal: stopper.signal,
+					stopped: () => stopper.stopped(),
+					onBoard: renderBoard,
+					onTaskFinished: async (task, run, report, ok) => {
+						await h.save(reportsDir, `${task.id}-${run.slot!.id}.md`, report);
+						if (stopper.stopped()) return;
+						// Every finished task renders its report — the intermediate work IS the output.
+						h.panel({ kind: "solo", command: "fh-collaborate", ok, agent: toStat(run), artifactsDir }, `### Task ${task.id} (${task.mode}) — ${run.slot!.name}\n${task.description}\n\n${report}`);
+					},
+				});
+				taskExecutions.push(...graph.executions);
+				const executionFailure = graph.failure;
 				if (stopper.stopped()) {
 					h.stoppedPanel("fh-collaborate", runs, artifactsDir, startedAt, "Stopped during delegated execution; finished task reports remain on disk.");
 					return;
@@ -270,12 +227,11 @@ export function registerCollaborateCommand(pi: ExtensionAPI, h: HarnessDeps): vo
 				// ── Phase 4: one final architect integration turn, still under the single-writer invariant ──
 				ctx.ui.setStatus(CUSTOM_TYPE, "collaborate: final architect integration…");
 				const finalStartedAt = Date.now();
-				activeWriters++;
-				maxConcurrentWriteEnabledChildren = Math.max(maxConcurrentWriteEnabledChildren, activeWriters);
+				enterWriter(writers);
 				try {
 					await runChild({ run: architectRun, prompt: collabCoordinatePrompt(prompt, reportsDir, planPath), systemPrompt: contractSystemPrompt(stack.architect.systemPrompt, "SYSTEM_PROMPT_COLLAB_COORDINATOR.md"), appendSystemPrompts: stack.architect.appendSystemPrompts, tools: FULL_TOOLS, thinking: stack.architect.thinking, ...h.slotNextSpawn(stack.architect, architectRun, initialSpawns.get(stack.architect.id)!, ctx), cwd: ctx.cwd, timeoutMs: h.childTimeoutMs(), signal: stopper.signal });
 				} finally {
-					activeWriters--;
+					exitWriter(writers);
 				}
 				taskExecutions.push({ taskId: "final", slot: stack.architect.id, mode: "write", startedAt: finalStartedAt, endedAt: Date.now(), ok: runOk(architectRun) && !stopper.stopped() });
 				if (stopper.stopped()) {
@@ -284,12 +240,12 @@ export function registerCollaborateCommand(pi: ExtensionAPI, h: HarnessDeps): vo
 				}
 				await h.save(collabDir, "final.md", runOk(architectRun) ? architectRun.text : `FAILED: ${runError(architectRun)}`);
 				const worktreeCommandsObserved = runs.flatMap((run) => run.toolEvents).filter((event) => event.name === "bash" && /\bgit\s+worktree\b/.test(event.argument));
-				const ok = runOk(architectRun) && maxConcurrentWriteEnabledChildren === 1 && worktreeCommandsObserved.length === 0;
+				const ok = runOk(architectRun) && writers.max === 1 && worktreeCommandsObserved.length === 0;
 				h.panel({ kind: "collab", command: "fh-collaborate", ok, round: plan.tasks.length, prompt, agent: toStat(architectRun), sources: runs.map(toStat), artifactsDir, ...h.totals(runs, startedAt) }, runOk(architectRun) ? architectRun.text : `Final coordination failed: ${runError(architectRun)}`);
-				await h.save(artifactsDir, "summary.json", JSON.stringify({ command: "fh-collaborate", ok, plan, taskExecutions, maxConcurrentWriteEnabledChildren, worktreeCommandsObserved, writerLeasePath: writerLease?.path, agents: runs.map(toStat), sessions: Object.fromEntries(slots.map((slot) => [slot.id, runs.find((run) => run.slot?.id === slot.id)?.sessionRef ?? h.cachedSlotId(slot)])), ...h.totals(runs, startedAt) }, null, 2));
+				await h.save(artifactsDir, "summary.json", JSON.stringify({ command: "fh-collaborate", ok, plan, taskExecutions, maxConcurrentWriteEnabledChildren: writers.max, worktreeCommandsObserved, writerLeasePath: writerLease?.path, agents: runs.map(toStat), sessions: Object.fromEntries(slots.map((slot) => [slot.id, runs.find((run) => run.slot?.id === slot.id)?.sessionRef ?? h.cachedSlotId(slot)])), ...h.totals(runs, startedAt) }, null, 2));
 			} finally {
 				const observedWorktrees = runs.flatMap((run) => run.toolEvents).filter((event) => event.name === "bash" && /\bgit\s+worktree\b/.test(event.argument));
-				await h.ensureSummary(artifactsDir, { command: "fh-collaborate", ok: false, stopped: stopper.stopped(), plan, taskExecutions, maxConcurrentWriteEnabledChildren, worktreeCommandsObserved: observedWorktrees, writerLeasePath: writerLease?.path, agents: runs.map(toStat), sessions: Object.fromEntries(slots.map((slot) => [slot.id, runs.find((run) => run.slot?.id === slot.id)?.sessionRef ?? h.cachedSlotId(slot)])), ...h.totals(runs, startedAt) });
+				await h.ensureSummary(artifactsDir, { command: "fh-collaborate", ok: false, stopped: stopper.stopped(), plan, taskExecutions, maxConcurrentWriteEnabledChildren: writers.max, worktreeCommandsObserved: observedWorktrees, writerLeasePath: writerLease?.path, agents: runs.map(toStat), sessions: Object.fromEntries(slots.map((slot) => [slot.id, runs.find((run) => run.slot?.id === slot.id)?.sessionRef ?? h.cachedSlotId(slot)])), ...h.totals(runs, startedAt) });
 				writerLease?.release();
 				stopper.release();
 				stopWidget();

@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { CollaborationTask } from "./collaboration-graph.ts";
+import { rankOpenGaps, type CriterionOutcome, type Rubric } from "./gauntlet-rubric.ts";
 import { orderedSlots, type ModelSlot, type ModelStack } from "./model-stack.ts";
 import { runOk, runError, shortModel, truncateChars, type AgentRun } from "./runtime.ts";
 
@@ -287,6 +288,123 @@ export function collabExecutePrompt(slot: ModelSlot, prompt: string, task: Colla
 
 export function collabCoordinatePrompt(prompt: string, reportsDir: string, planPath: string): string {
 	return fill("USER_PROMPT_COLLAB_COORDINATE.md", { REPORTS_DIR: reportsDir, PLAN_PATH: planPath, PROMPT: prompt });
+}
+
+// ═══ Gauntlet ════════════════════════════════════════════════════════════════
+
+/** A compact, readable view of the delegation plan for the rubric author. */
+export function planSummary(tasks: CollaborationTask[]): string {
+	return tasks.map((task) => `- **${task.id}** (${task.assignee}, ${task.mode}) — ${task.description}${task.outputs.length ? `\n  outputs: ${task.outputs.join(", ")}` : ""}`).join("\n");
+}
+
+/**
+ * The ARCHITECT writes the acceptance BAR before any build, to a harness-dictated path.
+ * Same transport as the auto-validate gate: a FILE, never a fence — a rubric pasted into
+ * a code block is truncated at the first ``` inside it.
+ */
+export function gauntletRubricPrompt(prompt: string, tasks: CollaborationTask[], rubricPath: string): string {
+	return fill("USER_PROMPT_GAUNTLET_RUBRIC.md", {
+		RUBRIC_PATH: rubricPath,
+		PROMPT: prompt,
+		TASK_IDS: tasks.map((task) => task.id).join(", "),
+		PLAN_SUMMARY: planSummary(tasks),
+	});
+}
+
+export const gauntletCriticSystem = (): string => promptTemplate("SYSTEM_PROMPT_GAUNTLET_CRITIC.md");
+
+/** The rubric as the critic reads it — one block per criterion, evidence made prominent. */
+export function rubricText(rubric: Rubric): string {
+	return rubric.criteria
+		.map((criterion) => [`## ${criterion.id} · ${criterion.severity.toUpperCase()}`, `requirement: ${criterion.requirement}`, `evidence: ${criterion.evidence}`, criterion.tasks.length ? `judges tasks: ${criterion.tasks.join(", ")}` : "judges: the artifact as a whole"].join("\n"))
+		.join("\n\n");
+}
+
+/**
+ * What a blind critic sees: the request, the rubric, and the real project. Deliberately
+ * NOT included — builder reports, prior verdicts, the round ledger, or any other critic's
+ * name. The isolation is the mechanism; widening this prompt breaks the flow.
+ */
+export function gauntletCriticPrompt(prompt: string, rubric: Rubric, cwd: string, round: number, maxRounds: number): string {
+	return fill("USER_PROMPT_GAUNTLET_CRITIC.md", {
+		CWD: cwd,
+		PROMPT: prompt,
+		ROUND: String(round),
+		MAX_ROUNDS: String(maxRounds),
+		CRITERIA_COUNT: String(rubric.criteria.length),
+		RUBRIC: rubricText(rubric),
+	});
+}
+
+/** Tallied outcomes for the adjudicator: open criteria only, every dissent attributed. */
+export function outcomesText(outcomes: CriterionOutcome[]): string {
+	const open = rankOpenGaps(outcomes);
+	if (!open.length) return "Every criterion cleared unanimously.";
+	return open
+		.map((outcome) =>
+			[
+				`## ${outcome.criterion.id} · ${outcome.criterion.severity.toUpperCase()} · OPEN (${outcome.fails} fail / ${outcome.passes} pass)`,
+				`requirement: ${outcome.criterion.requirement}`,
+				`evidence: ${outcome.criterion.evidence}`,
+				...outcome.gaps.map((gap) => `----- BEGIN CRITIC FINDING -----\nCRITIC: ${gap.slot}\nobserved: ${gap.evidence}\ngap: ${gap.gap}\n----- END CRITIC FINDING -----`),
+			].join("\n"),
+		)
+		.join("\n\n");
+}
+
+export function gauntletAdjudicatePrompt(
+	prompt: string,
+	outcomes: CriterionOutcome[],
+	panelSize: number,
+	round: number,
+	maxRounds: number,
+	gate: { code: number; output: string },
+	workbench: string,
+	assigneeIds: string[],
+	repairPath: string,
+): string {
+	return fill("USER_PROMPT_GAUNTLET_ADJUDICATE.md", {
+		PROMPT: prompt,
+		ROUND: String(round),
+		MAX_ROUNDS: String(maxRounds),
+		PANEL_SIZE: String(panelSize),
+		REPAIR_PATH: repairPath,
+		ASSIGNEE_IDS: assigneeIds.join(", "),
+		OUTCOMES: truncateChars(outcomesText(outcomes), HANDOFF_MAX),
+		GATE_EXIT_CODE: String(gate.code),
+		GATE_OUTPUT: truncateChars(gate.output.trim() || "(no output)", 8_000),
+		WORKBENCH: truncateChars(workbench.trim() || "(first round — no history yet)", 12_000),
+	});
+}
+
+export function gauntletRepairPrompt(
+	slot: ModelSlot,
+	prompt: string,
+	task: CollaborationTask,
+	openCriteria: CriterionOutcome[],
+	handoff: string,
+	round: number,
+	maxRounds: number,
+): string {
+	return fill("USER_PROMPT_GAUNTLET_REPAIR.md", {
+		SLOT_NAME: slot.name,
+		MODEL: slot.model,
+		TASK_ID: task.id,
+		ROUND: String(round),
+		MAX_ROUNDS: String(maxRounds),
+		TASK_DESCRIPTION: task.description,
+		TASK_OUTPUTS: task.outputs.length ? task.outputs.map((output) => `- ${output}`).join("\n") : "- concrete repair report",
+		OPEN_CRITERIA: openCriteria.length ? truncateChars(outcomesText(openCriteria), Math.floor(HANDOFF_MAX / 2)) : "(none listed — follow the task description)",
+		HANDOFF: truncateChars(handoff || "No upstream reports; inspect the current project state.", Math.floor(HANDOFF_MAX / 2)),
+		MODE_CONTRACT: task.mode === "read" ? "READ-ONLY TASK: use read/grep/find/ls only; do not mutate the project." : "WRITE TASK: you hold the harness's sole writer token. Full tools are enabled, and no other writer is active.",
+		PROMPT: prompt,
+	});
+}
+
+export const gauntletIntegratorSystem = (): string => promptTemplate("SYSTEM_PROMPT_GAUNTLET_INTEGRATOR.md");
+
+export function gauntletIntegratePrompt(prompt: string, rubric: Rubric, cwd: string): string {
+	return fill("USER_PROMPT_GAUNTLET_INTEGRATE.md", { CWD: cwd, PROMPT: prompt, RUBRIC: rubricText(rubric) });
 }
 
 // ═══ Strict-output parsing ═══════════════════════════════════════════════════

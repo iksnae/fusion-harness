@@ -127,6 +127,7 @@ No config auto-discovery occurs; `--fh-config` is explicit.
 | `/fh-fusion "<prompt>" "<instruction>"` | Every slot researches read-only; one fresh temporary FUSION agent is the sole CWD writer; then the complete fused result is synchronized to every model with exact ACK evidence. |
 | `/fh-debate [--rounds N] <prompt>` | N-way read-only debate. Each round every surviving agent receives every other agent's clearly labeled prior opinion, may pick/change sides, and closes without a judge. |
 | `/fh-collaborate <prompt>` | Every agent plans read-only, the architect merges the plans into one validated delegation DAG, then tasks execute the moment their dependencies clear — parallel where the DAG allows, sequential paths where it doesn't, exactly one shared-CWD writer at a time — closed by a final architect integration turn. Proposals, the task breakdown, and every task report render as panels; a live task board runs below the editor. |
+| `/fh-gauntlet [--max-rounds N] <prompt>` | Adversarial review loop. The architect writes an acceptance rubric and the validator a `uv` gate BEFORE any build; the delegation DAG builds; then every round the gate re-runs and every slot audits the artifact as a blind CRITIC on a fresh throwaway session — no builder reports, no prior verdicts. A criterion clears only when every critic passes it. The ADJUDICATOR ranks the open gaps and delegates repairs, the next round mints new critics, and a fresh INTEGRATOR reads the assembled whole before the final architect turn. Ends `passed`, `plateau`, or `exhausted` — never a silent pass. |
 | `/fh-only [slot] [prompt]` | Address one slot directly. Without a prompt it arms the next plain input as a one-send route; selecting the armed slot again disarms it. |
 | `/fh-model` | Three-step picker: slot → model → thinking. Session-only; never rewrites YAML. Main applies both `pi.setModel()` and `pi.setThinkingLevel()` to raw chat. |
 | `/fh-auto-validate <prompt>` | Existing gate-first ARCHITECT + Main build loop. |
@@ -148,6 +149,7 @@ Agents must never overwrite each other's work.
 - `/fh-opinion` and `/fh-debate`: all agents are read-only (`read,grep,find,ls`).
 - `/fh-fusion`: all source workers are read-only. Their answers are captured under the run's `/tmp/fusion-harness-*` directory. Only the temporary FUSION agent gets full tools and may modify the CWD.
 - `/fh-collaborate`: planning and delegation are tool-enforced read-only; the harness persists the architect's plan JSON. Execution is dependency-driven — read tasks overlap freely, but every write-enabled task waits for the single global writer token, so `maxConcurrentWriteEnabledChildren` is always 1. Worktree commands are observed and fail the run.
+- `/fh-gauntlet`: same execution model as `/fh-collaborate` — both run the shared scheduler in `modules/task-executor.ts`, so the build and every repair round observe one writer token. Critics are read-only by tool allowlist (`CRITIC_TOOLS`, no `write`/`edit`/`bash`) and never repair what they judge.
 - `/fh-only` and `/fh-auto-validate` have one active writer by design.
 
 A CWD-scoped atomic writer lease prevents separate harness processes from mutating the same checkout simultaneously. Child agents run in their own process groups so Escape, timeout, or session shutdown reaches Pi plus tool/bash descendants. Tool allowlists enforce planning safety; prompt contracts also prohibit detached background jobs.
@@ -211,6 +213,46 @@ After the sole-writer FUSION agent finishes:
 
 `/fh-auto-validate` inverts the usual order: the VALIDATOR writes a `uv` acceptance gate to disk BEFORE any building happens, a baseline run proves the gate starts red, then Main builds until the gate passes (default cap 5 validations). Failures feed back verbatim; from the third failure the validator adds a read-only triage brief, with a one-shot gate repair if the gate itself is the defect.
 
+---
+
+## Adversarial review: the gauntlet
+
+`/fh-gauntlet` is `/fh-collaborate` with a hostile panel bolted to the end of every round. A gate proves the work *runs*; a gauntlet asks whether it is any *good* — and asks agents who have never seen the build.
+
+It composes the two existing disciplines. The bar is written first, like the auto-validate gate. The work is delegated across slots, like a collaboration. What is new is what happens after the build.
+
+```
+BAR    proposals ─▶ delegation DAG ─▶ rubric.json ─▶ gate.py ─▶ baseline (RED)
+BUILD  DAG executes on dependency readiness · ONE shared-CWD writer at a time
+LOOP   gate ─▶ N blind CRITICs (fresh sessions) ─▶ tally ─▶ ADJUDICATOR ─▶ repairs
+         └── next round mints brand-new critics ──┘
+CLOSE  fresh INTEGRATOR reads the assembled whole ─▶ final architect turn
+```
+
+**The bar comes first.** Before anything is built, the ARCHITECT writes `rubric.json`: numbered criteria, each with a `severity` and — mandatory — the `evidence` that settles it. "Reads well" is rejected by the schema; a path, a command and its expected output, or a specific observable behavior is not. Beside it the VALIDATOR writes a `uv` acceptance gate, exactly as in `/fh-auto-validate`. The rubric catches *built the wrong thing well*; the gate catches *claimed it works*. Neither subsumes the other, so both run every round.
+
+**Critics are blind by construction.** Each round, every configured slot audits the artifact as a CRITIC on a **fresh throwaway session** — a directory that has never been used, no `fork`, no `sessionId`, no `resume`. A critic sees the original request, the rubric, and the real files. It does not see the builders' reports, their reasoning, the round ledger, or any other critic's verdict. The isolation is the mechanism, not a courtesy: an agent that remembers building the thing is not auditing it.
+
+**Nobody grades their own work, and nobody grades their own retry.** The critic sessions are per round *and* per slot, so the agent that audited round 1 never audits round 2. Fresh instances are what stop a panel drifting toward lenience once it has watched three drafts go by.
+
+**Critics cannot write.** `CRITIC_TOOLS` is `read,grep,find,ls` — no `write`, no `edit`, no `bash`. A critic that fixes what it finds has stopped being a critic, so the tool allowlist removes the option rather than asking politely.
+
+**One dissent keeps a criterion open.** Consensus is unanimous-to-clear. Majority voting would let two lenient critics overrule the one that actually opened the file, which is the exact failure the panel exists to prevent. Verdicts are strict JSON validated against the rubric: a fail without a concrete `gap` is rejected, and a criterion with no verdict is an error — silence never clears anything. A critic that cannot return valid JSON twice is dropped from the tally, and an empty panel is a hard failure, never a pass.
+
+**The adjudicator ranks, it does not tally.** The ARCHITECT (wearing the ADJUDICATOR hat) receives the open criteria with every dissent attributed, plus the gate output and the round ledger, and delegates repairs for the largest meaningful gaps — blockers before majors before minors. A dissent it judges wrong gets no task and gets said out loud. Repair tasks run through the same single-writer scheduler as the build.
+
+**It stops for a stated reason.** `passed` (every criterion cleared unanimously and the gate is green), `plateau` (a round cleared nothing new and did not move the gate — repeating the loop will not help), or `exhausted` (`--max-rounds`, default 3). The final panel names which, and lists every still-open gap attributed to the critic who found it. There is no silent pass.
+
+Between rounds the loop carries `workbench.md`, a compact ledger of what each round tried, rather than an accumulating transcript.
+
+```bash
+/fh-gauntlet build a DuckDB-backed CLI that reports the ten slowest queries
+/fh-gauntlet --max-rounds 5 harden the auth middleware against the OWASP top ten
+```
+
+Everything lands under the run's artifacts directory: `gauntlet/rubric.json`, `gauntlet/gate.py`, `gauntlet/critics/round-N/<slot>.json` (every verdict, attributed), `gauntlet/reports/`, `gauntlet/workbench.md`, and a `summary.json` carrying the stop reason, the per-round tally, and every criterion left open.
+
+---
 
 ## Sessions and UI
 
@@ -251,6 +293,9 @@ extensions/fusion-harness/
 │   ├── cmd-readonly.ts        # /fh-opinion + /fh-debate
 │   ├── cmd-fusion.ts          # /fh-fusion
 │   ├── cmd-build.ts           # /fh-collaborate + /fh-auto-validate (writer-lease holders)
+│   ├── cmd-gauntlet.ts        # /fh-gauntlet — build, blind critic panel, adjudicated repair
+│   ├── task-executor.ts      # shared dependency scheduler + the single-writer invariant
+│   ├── gauntlet-rubric.ts     # acceptance-bar + verdict schemas, unanimous-to-clear tally
 │   ├── model-stack.ts         # YAML parsing, validation, colors, legacy synthesis
 │   ├── agent-layout.ts        # responsive 1-5 agent layout math
 │   ├── collaboration-graph.ts # DAG validation, cycle detection, dependency levels
@@ -267,6 +312,9 @@ extensions/fusion-harness/
 - `modules/cmd-readonly.ts` — `/fh-opinion` and `/fh-debate`.
 - `modules/cmd-fusion.ts` — `/fh-fusion`.
 - `modules/cmd-build.ts` — `/fh-collaborate` and `/fh-auto-validate` (the writer-lease holders).
+- `modules/cmd-gauntlet.ts` — `/fh-gauntlet`: the adversarial review loop (rubric and gate first, build, blind critic panel per round, adjudicated repairs, cold integration read).
+- `modules/task-executor.ts` — the dependency-driven task scheduler and the single-writer invariant, shared by `/fh-collaborate` and `/fh-gauntlet`.
+- `modules/gauntlet-rubric.ts` — acceptance-criteria and verdict schemas, plus the unanimous-to-clear tally (one dissenting critic keeps a criterion open).
 - `modules/model-stack.ts` — real YAML parsing, validation, colors, and legacy synthesis.
 - `modules/agent-layout.ts` — responsive 1–5 agent layout calculations.
 - `modules/collaboration-graph.ts` — DAG validation, cycle detection, and dependency levels.

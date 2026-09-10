@@ -25,7 +25,7 @@ describe("orchestration contracts", () => {
   });
 
   test("registers target commands and deletes unsafe/obsolete commands", () => {
-    for (const command of ["fh", "fh-model", "fh-only", "fh-opinion", "fh-fusion", "fh-debate", "fh-collaborate", "fh-auto-validate", "fh-system-prompt", "fh-reset"]) {
+    for (const command of ["fh", "fh-model", "fh-only", "fh-opinion", "fh-fusion", "fh-debate", "fh-collaborate", "fh-gauntlet", "fh-auto-validate", "fh-system-prompt", "fh-reset"]) {
       expect(source).toContain(`registerCommand("${command}"`);
     }
     expect(source).not.toContain('registerCommand("fh-both"');
@@ -59,7 +59,20 @@ describe("orchestration contracts", () => {
   });
 
   test("collaborate serializes write-enabled children", () => {
-    expect(source).toContain("activeWriters++");
+    // The invariant moved out of cmd-build.ts into task-executor.ts when /fh-gauntlet
+    // needed the same scheduler. TWO copies would be two places for a concurrent writer
+    // to slip through, so assert there is exactly one implementation and that every
+    // consumer goes through it rather than re-deriving the accounting locally.
+    const executor = readFileSync(join(root, "modules", "task-executor.ts"), "utf8");
+    expect(executor).toContain("if (write) enterWriter(counter)");
+    expect(executor).toContain('task.mode === "write" && counter.active > 0');
+    expect(executor).toContain("counter.max = Math.max(counter.max, counter.active)");
+    for (const module of ["cmd-build.ts", "cmd-gauntlet.ts"]) {
+      const consumer = readFileSync(join(root, "modules", module), "utf8");
+      expect(consumer).toContain("executeTaskGraph({");
+      expect(consumer).toContain("counter: writers");
+      expect(consumer).not.toContain("activeWriters++");
+    }
     expect(source).toContain("maxConcurrentWriteEnabledChildren");
     expect(source).toContain("acquireWriterLease(ctx.cwd, `/fh-collaborate");
     expect(source).toContain("parseStrictJsonObject(architectRun.text");

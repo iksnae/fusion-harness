@@ -21,6 +21,10 @@ export const FULL_TOOLS = "read,grep,find,ls,bash,edit,write"; // sequential age
 // turn holds the same toolset while the run's single gate repair is unused (a GATE DEFECT
 // diagnosis may rewrite the gate at that one path), then drops to READONLY_TOOLS.
 export const VALIDATOR_TOOLS = "read,grep,find,ls,write";
+// Critics are hostile AUDITORS, never authors: they read the real artifact and nothing
+// else. Enforced by tools, not by instruction — a critic that cannot write cannot
+// "helpfully" fix what it was asked to judge.
+export const CRITIC_TOOLS = "read,grep,find,ls";
 
 // ═══ Shared limits ═══════════════════════════════════════════════════════════
 
@@ -33,14 +37,28 @@ export const BOOT_TYPE = "fusion-harness-boot"; // the boot banner's own tag —
 
 // ═══ Roles ═══════════════════════════════════════════════════════════════════
 
-export type Role = "ARCHITECT" | "BUILDER" | "FUSION" | "VALIDATOR";
+/**
+ * Display roles. These are NOT config entities — the YAML stack defines SLOTS
+ * (model + thinking + color), and a command dresses a slot in whichever role it is
+ * playing for that turn. VALIDATOR is the architect slot holding the gate contract;
+ * CRITIC/ADJUDICATOR/INTEGRATOR are the three /fh-gauntlet hats.
+ */
+export type Role = "ARCHITECT" | "BUILDER" | "FUSION" | "VALIDATOR" | "CRITIC" | "ADJUDICATOR" | "INTEGRATOR";
+
+/** Roles whose NAME is fixed by the slot they wear (architect vs builder), not by the hat. */
+export const SLOT_NAMED_ROLES: ReadonlySet<Role> = new Set<Role>(["ARCHITECT", "BUILDER"]);
 
 /** One consistent color per role, everywhere (columns, footer, panels, errors). */
-export const ROLE_COLOR: Record<Role, "accent" | "warning" | "success" | "mdLink"> = {
+export const ROLE_COLOR: Record<Role, "accent" | "warning" | "success" | "mdLink" | "error"> = {
 	ARCHITECT: "accent",
 	BUILDER: "warning",
 	FUSION: "success",
 	VALIDATOR: "mdLink",
+	// The gauntlet hats. CRITIC is deliberately the error hue — a hostile auditor's
+	// column should not read as friendly progress.
+	CRITIC: "error",
+	ADJUDICATOR: "accent",
+	INTEGRATOR: "success",
 };
 
 /** One consistent glyph per role, paired with the color above. */
@@ -49,6 +67,9 @@ export const ROLE_GLYPH: Record<Role, string> = {
 	BUILDER: "▲",
 	FUSION: "⧉",
 	VALIDATOR: "✓",
+	CRITIC: "⚔",
+	ADJUDICATOR: "⚖",
+	INTEGRATOR: "⊕",
 };
 
 /** Render an actual configured #RRGGBB slot color without consuming a pi theme token. */
@@ -143,7 +164,10 @@ export interface FhDetails {
 		| "system-prompt"
 		| "solo" // /fh-only — one selected agent, one full-width answer
 		| "closing" // /fh-debate — the final round: two closing statements, side by side
-		| "collab"; // /fh-collaborate — the shared deliverable after the last turn
+		| "collab" // /fh-collaborate — the shared deliverable after the last turn
+		| "rubric" // /fh-gauntlet — the acceptance bar, written before any build
+		| "verdicts" // /fh-gauntlet — one round of blind critic verdicts, side by side
+		| "gauntlet"; // /fh-gauntlet — the adjudicated round result / final deliverable
 	command?: string; // the slash command that produced this panel ("fh-fusion", …)
 	title?: string; // duo panels: what THIS pair of columns is (e.g. "round 2 — rebuttals")
 	ok: boolean;
@@ -161,6 +185,9 @@ export interface FhDetails {
 	gateExitCode?: number;
 	scriptPath?: string;
 	artifactsDir?: string;
+	criteriaTotal?: number; // /fh-gauntlet — size of the rubric
+	criteriaPassed?: number; // /fh-gauntlet — criteria cleared by consensus this round
+	stopReason?: string; // /fh-gauntlet — why the loop ended (passed | plateau | exhausted)
 	totalMs?: number;
 	totalCostUsd?: number;
 	error?: string;
