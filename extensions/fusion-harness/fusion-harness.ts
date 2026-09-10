@@ -313,7 +313,9 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	let childVisibleModelsPromise: Promise<Set<string>> | undefined;
-	const childVisibleModels = async (): Promise<Set<string>> => {
+	/** `refresh` discards the memoized catalogue and asks the child again (see the retry below). */
+	const childVisibleModels = async (refresh = false): Promise<Set<string>> => {
+		if (refresh) childVisibleModelsPromise = undefined;
 		childVisibleModelsPromise ??= (async () => {
 			const invocation = piInvocation(["--no-extensions", "--list-models"]);
 			const result = await pi.exec(invocation.command, invocation.args, { timeout: 30_000 });
@@ -336,11 +338,26 @@ export default function (pi: ExtensionAPI) {
 		const errors: string[] = [];
 		const resolved = new Map<string, any>();
 		let childCatalogue = new Set<string>();
+		let catalogueError: string | undefined;
 		try {
 			childCatalogue = await childVisibleModels();
 		} catch (error) {
-			errors.push(error instanceof Error ? error.message : String(error));
+			catalogueError = error instanceof Error ? error.message : String(error);
 		}
+		// The catalogue child races the parent's own startup model load, and a short read
+		// loses the END of the list first — so the slot that sorts last is the one wrongly
+		// reported unrunnable. Measured: the same launch failed ~1 time in 3 on
+		// openrouter/z-ai/glm-5.3-flash, while ten isolated runs of the identical command
+		// returned it every time. Ask once more before calling a configured slot dead; the
+		// call costs ~0.25s and only happens when something is already missing.
+		if (!catalogueError && orderedSlots(configuredStack).some((slot) => !childCatalogue.has(slot.model))) {
+			try {
+				childCatalogue = await childVisibleModels(true);
+			} catch (error) {
+				catalogueError = error instanceof Error ? error.message : String(error);
+			}
+		}
+		if (catalogueError) errors.push(catalogueError);
 		for (const slot of orderedSlots(configuredStack)) {
 			const slash = slot.model.indexOf("/");
 			const model = slash > 0 ? ctx.modelRegistry.find(slot.model.slice(0, slash), slot.model.slice(slash + 1)) : undefined;
