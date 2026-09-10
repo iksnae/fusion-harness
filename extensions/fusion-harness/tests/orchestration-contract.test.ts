@@ -24,6 +24,23 @@ describe("orchestration contracts", () => {
     expect(source).not.toContain('if (!proc.killed)');
   });
 
+  test("no command description runs longer than the established ceiling", () => {
+    // Slash-command descriptions render in pi's command menu on one row. The harness has
+    // held them at 178 chars or less since /fh-collaborate and /fh-auto-validate set the
+    // mark; a new command that overshoots it is the one that renders wrong. Caught in
+    // review after /fh-gauntlet shipped at 218.
+    const CEILING = 178;
+    const offenders: string[] = [];
+    // Both quote styles: /fh-fusion's description is single-quoted, and a guard that only
+    // saw double quotes would let exactly that one through.
+    for (const match of source.matchAll(/registerCommand\("([a-z-]+)",\s*\{\s*description:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/gs)) {
+      const [, name, literal] = match;
+      const length = literal!.length - 2;
+      if (length > CEILING) offenders.push(`${name} (${length} chars)`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
   test("registers target commands and deletes unsafe/obsolete commands", () => {
     for (const command of ["fh", "fh-model", "fh-only", "fh-opinion", "fh-fusion", "fh-debate", "fh-collaborate", "fh-gauntlet", "fh-auto-validate", "fh-system-prompt", "fh-reset"]) {
       expect(source).toContain(`registerCommand("${command}"`);

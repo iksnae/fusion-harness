@@ -81,7 +81,7 @@ export function registerGauntletCommand(pi: ExtensionAPI, h: HarnessDeps): void 
 	const TASKBOARD_WIDGET = `${CUSTOM_TYPE}-gauntlet-board`;
 	pi.registerCommand("fh-gauntlet", {
 		description:
-			"Adversarial review loop: agents plan and build against a rubric written first, then every slot audits the artifact blind on a fresh session each round — until no critic finds a gap or --max-rounds (default 3) is spent.",
+			"Agents build against a rubric written first, then every slot audits the artifact blind on a fresh session each round until no critic finds a gap or the round cap is spent.",
 		handler: async (raw, ctx) => {
 			h.noteHost(ctx);
 			let input = (raw ?? "").trim();
