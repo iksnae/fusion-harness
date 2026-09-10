@@ -1033,7 +1033,7 @@ export default function (pi: ExtensionAPI) {
 		['/fh-fusion "<prompt>" "<fusion>"', "parallel research, one writer, all ACK"],
 		["/fh-debate [--rounds N] <prompt>", "all-to-all debate, no judge"],
 		["/fh-collaborate <prompt>", "agents plan, architect delegates, parallel build"],
-		["/fh-gauntlet [--max-rounds N] <prompt>", "build, then blind critics audit until nothing is left"],
+		["/fh-gauntlet [--max-rounds N] <prompt>", "blind critics audit every build round"],
 		["/fh-only [slot] [prompt]", "route one prompt to one agent"],
 		["/fh-model", "pick slot, model, thinking"],
 		["/fh-auto-validate [--max-validations N] <prompt>", "gate written first, build until green"],
